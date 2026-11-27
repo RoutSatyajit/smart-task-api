@@ -1,0 +1,377 @@
+openapi: 3.0.3
+info:
+  title: Smart Task API
+  version: 1.0.0
+  description: |
+    REST API for tasks with natural-language creation, subtasks, automatic
+    breakdown, idempotent POSTs, filtering, search, ordering and pagination.
+    Every 400/404/422/502/503 response uses the same `Error` shape.
+servers:
+  - url: http://127.0.0.1:8000/api
+
+tags:
+  - name: Tasks
+  - name: AI
+  - name: Subtasks
+
+paths:
+  /tasks/:
+    get:
+      tags: [Tasks]
+      summary: List tasks (filter, search, order, paginate)
+      parameters:
+        - { name: completed, in: query, schema: { type: boolean } }
+        - { name: priority, in: query, schema: { $ref: "#/components/schemas/Priority" } }
+        - { name: recurrence, in: query, schema: { $ref: "#/components/schemas/Recurrence" } }
+        - { name: due_date, in: query, schema: { type: string, format: date } }
+        - { name: due_after, in: query, description: "due_date >= value", schema: { type: string, format: date } }
+        - { name: due_before, in: query, description: "due_date <= value", schema: { type: string, format: date } }
+        - { name: parent, in: query, description: "Subtasks of this task id", schema: { type: integer } }
+        - { name: is_subtask, in: query, description: "false = top-level tasks only", schema: { type: boolean } }
+        - { name: search, in: query, description: "Searches title and description", schema: { type: string } }
+        - name: ordering
+          in: query
+          description: "due_date, created_at, updated_at, title, priority (low<medium<high). Prefix with - for descending; comma-separate several."
+          schema: { type: string, example: "-priority,due_date" }
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: page_size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 10 } }
+      responses:
+        "200":
+          description: A page of tasks
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskPage" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Tasks]
+      summary: Create a task
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskInput" }
+            example: { title: Write report, description: Quarterly report, priority: high, due_date: "2026-12-15" }
+      responses:
+        "201":
+          description: Created (or replayed for a repeated Idempotency-Key)
+          headers:
+            Idempotent-Replayed:
+              description: Present with value "true" when the stored response was returned
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+
+  /tasks/{id}/:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Tasks]
+      summary: Get one task
+      responses:
+        "200":
+          description: The task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [Tasks]
+      summary: Replace a task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskInput" }
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Tasks]
+      summary: Partially update a task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskPatch" }
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Tasks]
+      summary: Delete a task (its subtasks are deleted too)
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/from-text/:
+    post:
+      tags: [AI]
+      summary: Create a task from plain English
+      description: |
+        Text is passed to `parse_task_text(text, today)`. Its output is
+        validated by the same serializer as user input. Invalid parser output
+        or a parser crash returns 502 and nothing is saved.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1 }
+            example: { text: Remind me to pay rent on the 1st of every month }
+      responses:
+        "201":
+          description: Task created from text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+              example:
+                id: 7
+                title: Pay rent
+                description: Remind me to pay rent on the 1st of every month
+                completed: false
+                due_date: "2026-12-01"
+                priority: medium
+                recurrence: monthly
+                parent: null
+                subtask_count: 0
+                created_at: "2026-11-27T12:00:00+05:30"
+                updated_at: "2026-11-27T12:00:00+05:30"
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+        "502":
+          description: Parser failed or returned invalid data (nothing saved)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: INVALID_PARSER_OUTPUT
+                  message: Parser returned data that failed validation
+                  details: [{ field: title, issue: must not be empty }]
+        "503":
+          description: LLM parser selected but LLM_API_KEY is not set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: LLM_NOT_CONFIGURED
+                  message: The language model is not configured (LLM_API_KEY missing)
+                  details: []
+
+  /tasks/{id}/subtasks/:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Subtasks]
+      summary: List a task's subtasks
+      responses:
+        "200":
+          description: Subtasks (not paginated)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Subtasks]
+      summary: Create one subtask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskInput" }
+      responses:
+        "201":
+          description: Subtask created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400":
+          description: Validation error, or the task is itself a subtask (SUBTASK_NOT_ALLOWED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tasks/{id}/breakdown/:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    post:
+      tags: [AI, Subtasks]
+      summary: Break a task into subtasks automatically
+      description: |
+        Calls `break_down_task(task)`. Every returned item is validated first;
+        if any item is invalid, none are saved (502).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "201":
+          description: Subtasks created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  parent: { type: integer }
+                  count: { type: integer }
+                  subtasks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Task" }
+        "400":
+          description: The task is itself a subtask (SUBTASK_NOT_ALLOWED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+        "502":
+          description: Breakdown failed or returned invalid items (nothing saved)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  parameters:
+    TaskId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Same key + same body returns the stored response without creating
+        anything. Same key + different body returns 422. Only successful
+        responses are stored.
+      schema: { type: string }
+
+  schemas:
+    Priority:
+      type: string
+      enum: [low, medium, high]
+    Recurrence:
+      type: string
+      enum: [daily, weekly, monthly, yearly]
+      nullable: true
+    TaskInput:
+      type: object
+      required: [title, description]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, minLength: 1 }
+        completed: { type: boolean, default: false }
+        due_date: { type: string, format: date, nullable: true, example: "2026-12-15" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        recurrence: { $ref: "#/components/schemas/Recurrence" }
+    TaskPatch:
+      type: object
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, minLength: 1 }
+        completed: { type: boolean }
+        due_date: { type: string, format: date, nullable: true }
+        priority: { $ref: "#/components/schemas/Priority" }
+        recurrence: { $ref: "#/components/schemas/Recurrence" }
+    Task:
+      allOf:
+        - $ref: "#/components/schemas/TaskInput"
+        - type: object
+          properties:
+            id: { type: integer, readOnly: true }
+            parent: { type: integer, nullable: true, readOnly: true }
+            subtask_count: { type: integer, readOnly: true }
+            created_at: { type: string, format: date-time, readOnly: true }
+            updated_at: { type: string, format: date-time, readOnly: true }
+    TaskPage:
+      type: object
+      properties:
+        count: { type: integer }
+        next: { type: string, nullable: true }
+        previous: { type: string, nullable: true }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+    ErrorDetail:
+      type: object
+      required: [field, issue]
+      properties:
+        field: { type: string }
+        issue: { type: string }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+              description: |
+                VALIDATION_ERROR, NOT_FOUND, PARSE_ERROR, SUBTASK_NOT_ALLOWED,
+                IDEMPOTENCY_KEY_REUSED, PARSER_ERROR, INVALID_PARSER_OUTPUT,
+                BREAKDOWN_ERROR, INVALID_BREAKDOWN_OUTPUT, LLM_NOT_CONFIGURED,
+                METHOD_NOT_ALLOWED, UNSUPPORTED_MEDIA_TYPE
+            message: { type: string }
+            details:
+              type: array
+              items: { $ref: "#/components/schemas/ErrorDetail" }
+
+  responses:
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Validation failed
+              details: [{ field: title, issue: must not be empty }]
+    NotFound:
+      description: Task not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: NOT_FOUND, message: Task not found, details: [] }
+    IdempotencyConflict:
+      description: Idempotency-Key reused with a different body
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: IDEMPOTENCY_KEY_REUSED
+              message: Idempotency-Key was already used with a different request body
+              details: [{ field: Idempotency-Key, issue: reused with a different request }]
